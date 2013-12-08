@@ -16,3 +16,6 @@
 *.exe
 *.out
 *.app
+
+!Lib/*.lib
+!Dll/*.dll
