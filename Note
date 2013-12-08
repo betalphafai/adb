@@ -1,1 +1,79 @@
 笔记
+
+adb的源码层次分明，代码简洁（可能是因为没有继承），但是要看懂adb的源码，就必须先知道这源码里面有什么模块，不然看起来会事倍功半！  
+  
+> adbd         (android) 运行在手机上，在/sbin/目录下   
+                         当手机开启“usb调试”时才会启动，如果关闭“usb调试”，/sbin/adbd进程会退出。  
+> adb client   (win)     client不直接跟adbd打交道，client处理用户输入，然后通知server作出相应的操作  
+> adb server   (win)     由client创建的进程，server直接跟adbd打交道，包括处理不同设备的adbd消息，数据传送。  
+                         如果server进程已经存在，那么会判断当前的server版本，是否跟client不一致，  
+                         server会被kill，然后重新创建。  
+> adb service  (win)     
+  
+  
+Sourcse File:   
+usb_vendors.*: 注商供应商，有些国产手机品牌并非是认证的供应商，需要手动添加。  
+sysdeps.h: 可以理解是用于代码移植。对系统的函数（非标准的c语言库函数，线程，锁，文件操作，socket）进行封装，一般喜欢在函数前加“adb_”。win平台下，如果用到文件句柄或者socket，会统一用一个结构FHRec来替代。
+
+1.
+文件：sysdeps_win32.cpp
+纠结了几天“FH”是什么，其实就是“common file descriptor handling”，FH结构体里：  
+typedef struct FHRec_  
+{  
+    FHClass    clazz;       //   保存文件操作的几个函数指针（_fh_file_read、_fh_file_write、_fh_file_init、_fh_file_close等）  
+    int        used;        // 表示是否被使用，alloc时被置为1，close的时候置为0  
+    int        eof;         // 判断是否读（写）完，如果读（写）没有完，eof为1  
+    union {                    //  
+        HANDLE      handle;  
+        SOCKET      socket;  
+        SocketPair  pair;  
+    } u;  
+    // event、mask和name都是socket相关  
+    HANDLE    event;  
+    int       mask;  
+    char  name[32];  
+} FHRec;  
+而对于_fh_file_read(FH f,void* buf,int len)的实现，当然是用win32的api写的。  
+FH就是google自己重新定义的一个文件句柄，由于c中没有“类”的概念，所以用一个“结构体”FHClass来将文件相关的“属性”和文件操作的几个“函数指针”封装在一起。  
+当然，FHRec_所指的常用文件，可以是普通的文件，还可以是通讯时的socket，也可以是socketpair。   
+  
+2.client与server间通讯  
+启动adb的时候，会获取用户输入，处理用户输入前，会先检查client和server的版本是否一致，然后再进行其他处理。这样引出client与server间通讯。实质是就是socket的读写。  
+这里说的是socket是上面所说的已经被封装了的FH结构。
+"adb devices"命令  
+ | adb_connect "host:devices"  
+ |  | fd = _adb_connect "host:version"      
+ |  | readx fd                          调用readx函数2次，1次获取消息的长度，1次获取消息的内容
+ |  | readx fd                          这里version号一般是4个字节，所以第1次返回4，第2次返回version号
+ |  |  | launch_server port             如果发现client与server的版本不对或者server没有启动，则调用launch_server函数
+ |  |  V                                否则不会调用launch_server函数
+ |  | close fd   
+ |  | fd = _adb_connect "host:devices"  然后对请求devices的消息
+ |  | return fd  
+ |  V    
+ |  readx fd                            还是读2次，第1次读取消息的长度，第2次读取消息
+ |  readx fd   
+ |  close fd   
+ V   
+每一次adb_connect可能看作是一次请求，请求获取server的相关信息，adb_connect的参数就是发送的消息（例如："host:devices"代表查询当前连接的设备个数；"host:version"代表查询server的版本等），调用adb_connect函数，会返回一个socket句柄，server会把返回消息写到socket里，client端只需要read就可以了。  
+  
+3.管道：  
+ADBserver是运行在win上的后台进程，client要使用adb的时候，需要启动server，等待server启动成功后，再进其他的一系列操作（不可能存在多个ADBserver，如果已经存在了一个ADBserver，会先把该ADBserver进程杀掉）。client进程等待server进程启动（等待启动成功的信号），2个进程通信，用到了Pipe（管道）。   
+一小段代码在launch_server函数里，CreatePipe函数创建2个“相通”的管道，启动server进程时，输入端Pipe1会作为参数，传递给下去。server进程入口函数进行一些初始化操作后，往Pipe1写数据（成功的信号或者不成功）。输出端Pipe2在client进程里一直等待信号，信号来了，就进行处理。    
+CreateProcees时，新创建的进程，需要从调用进程中继承输入端的Pipe1，所以CreateProcess的参数bInheritHandles应该为TRUE
+用到的函数：   
+CreatePipe    创建2个关联的管道，一个输入端，一个输出端   
+CreateProcess 创建线程，参数STARTUPINFO里，保存输入端的管道   
+ReadFile      从句柄读数据   
+WriteFile     向句柄写数据   
+  
+  
+附：   
+1.非标准c语言库函数  
+strtoul  string to unsigned long
+  
+2.ZeroMemory宏  
+adb源码里喜欢用ZeroMemory函数来对结构分配空间。但是ZeroMemory其实是一个宏，本质上是一个memset，定义在winnt.h头文件里：  
+#define RtlZeroMemory(Destination,Length) memset((Destination),0,(Length))  
+#define ZeroMemory RtlZeroMemory  
+在微软的SDK里。ZeroMemory会把Destination开始，长度为Length的数据全部置为0。用memset初始化struct或者数组很方便。如果是class，还是用构造函数来初始化数据更好。  
